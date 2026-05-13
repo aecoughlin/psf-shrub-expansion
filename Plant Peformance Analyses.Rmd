@@ -56,6 +56,8 @@ bm.grow.psf <- left_join(bm, grow, by="pot.code") %>%
   mutate(sp.avg=mean(bm.rate)) %>% 
   ungroup() %>% 
   mutate(psf=(bm.rate - sp.avg) / sp.avg)
+
+write.csv(bm.grow.psf, "PSF-exp-2022_plant-performance.csv")
 ```
 
 ### Calculate PSF index
