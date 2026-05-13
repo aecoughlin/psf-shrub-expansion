@@ -1,0 +1,1580 @@
+---
+title: "Microbial Community Analyses"
+author: "Aeran Coughlin"
+date: "2026-05-11"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+This R Markdown file contains the fungal community analyses employed for the manuscript "Microbial assemblages of coastal forested wetland soil promote growth of expanding woody shrub" by Coughlin & Wright. 
+
+### Load Packages and Data Files
+```{r}
+library(tidyverse)
+library(car)
+library(vegan)
+library(pals)
+library(dbstats)
+library(ape)
+library(FUNGuildR)
+library(betareg)
+library(VennDiagram)
+library(randomForest)
+library(phyloseq)
+library(corrr)
+library(patchwork)
+library(ggpubr)
+library(lmtest)
+library(lsmeans)
+library(multcomp)
+
+fun.otu <- read.csv("fun.table.csv")
+fun.tax <- read.csv("fun.tax.csv")
+
+pots <- read.csv("PSF-exp-2022_pot-data.csv")
+pp <- read.csv("PSF-exp-2022_plant-performance.csv")
+myco <- read.csv("PSF-exp-2022_myco.csv")
+```
+
+### Data Cleaning
+
+Filter only greenhouse data.
+
+```{r}
+# select only greenhouse samples 
+fun.otu.gh <- fun.otu %>% 
+  subset(Type=="GH") %>% 
+  arrange(plot.code) %>% 
+  dplyr::select(-c(2)) %>%
+  rename("pot.code"=plot.code)
+```
+
+Remove singletons.
+
+```{r}
+# convert to presence / absence
+fun.otu.pa <- decostand(fun.otu.gh %>% 
+                          arrange(pot.code) %>% 
+                          dplyr::select(-c(1)), method = "pa") 
+
+# select only ASVs with more than one occurrence (exclude singletons)
+fun.otu.nonsing <- fun.otu.pa %>% 
+  dplyr::select(where(~ is.numeric(.) && sum(., na.rm = TRUE) > 1)) %>% 
+  colnames()
+
+# extract only non-singletons from original otu table
+fun.otu.matrix <- fun.otu.gh %>% 
+  dplyr::select(all_of(fun.otu.nonsing))
+  
+# add pot code column 
+fun.otu.labeled <- cbind(fun.otu.gh %>% dplyr::select(pot.code), fun.otu.matrix)
+
+fun.otu.pots <- fun.otu.gh %>% 
+  dplyr::select(1) %>% 
+  left_join(pots, by="pot.code") %>% 
+  dplyr::select(pot.code, species, inoculum) %>% 
+  mutate(species = ifelse(species == "MYCE", "MOCE", species))
+
+fun.otu.list <- fun.otu.matrix %>% 
+  pivot_longer(names_to="OTU", values_to="count", 1:1113) %>% 
+  dplyr::select(OTU) %>% 
+  unique()
+```
+
+Remove sterile treatment ASVs from treatment samples to use for certain analyses
+
+```{r}
+# identify ASVs that are found in sterile treatments
+fun.otu.ster <- fun.otu.pots %>% 
+  filter(inoculum=="Sterile") %>% 
+  dplyr::select(pot.code) %>% 
+  left_join(fun.otu.labeled, by="pot.code") %>% 
+  dplyr::select(-c(1)) %>% 
+  dplyr::select(where(~ is.numeric(.) && sum(., na.rm = TRUE) > 0)) %>% 
+  colnames() # 373 ASVs
+
+# phylum breakdown in sterile treatment
+fun.ster.sum <- fun.otu.labeled %>% 
+  dplyr::select(all_of(fun.otu.ster))
+
+fun.ster.sum2 <-  fun.otu.pots %>% 
+  dplyr::select(pot.code, inoculum) %>%
+  cbind(fun.ster.sum) %>% 
+  filter(inoculum=="Sterile") %>% 
+  dplyr::select(-c(inoculum)) %>% 
+  pivot_longer(names_to="OTU", values_to="count", 2:374) %>% 
+  group_by(OTU) %>% 
+  summarise(sum=sum())
+
+# create table of ASVs only found in inoculated treatments
+# (exclude those found in sterile)
+fun.otu.inoc <- fun.otu.labeled %>% 
+  dplyr::select(-all_of(fun.otu.ster)) %>% 
+  left_join(fun.otu.pots %>% dplyr::select(pot.code, inoculum), by="pot.code") %>%
+  filter(inoculum!="Sterile") %>% 
+  dplyr::select(-c(inoculum)) # 741 ASVs
+
+#fun.tax.inoc <- fun.otu.inoc %>% 
+#  pivot_longer() %>% 
+#  left_join(fun.tax)
+```
+
+
+
+Quantify sampling depth across pots for assessing sampling evenness and rarefaction.
+
+```{r}
+# calculate number of sequence reads per pot
+pot.read.n <- fun.otu.labeled %>% 
+  mutate(rowsum = rowSums(select_if(., is.numeric), na.rm = TRUE)) %>% 
+  dplyr::select(pot.code, rowsum) # smallest size: 32762 reads
+
+# create histogram of sequence reads across pots
+ggplot(pot.read.n) + 
+  geom_histogram(aes(rowsum), bins=10, color="black", fill="pink") + 
+  xlab("Sequence reads per pot") + 
+  ylab("n") + 
+  theme_classic()
+```
+
+Identify the 10% most abundant ASVs for manual BLAST calling
+
+```{r}
+# select only top 10% most abundant ASVs from dataset
+fun.otu.total <- fun.otu.matrix %>% 
+  colSums() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="OTU") %>% 
+  rename("count"=".") %>% 
+  arrange(desc(count)) %>% 
+  top_n(111, count) %>% 
+  arrange(OTU) %>% 
+  left_join(fun.tax, by="OTU")
+
+# export for manual calling / confirmation
+write.csv(fun.otu.total, "fun.otu.total.csv")
+
+# reads in the top 10% most abundant ASVs
+top.10 <- fun.otu.total %>% summarise(sum=sum(count)) 
+
+# total reads in dataset 
+all.otus <- fun.otu.matrix %>% 
+  colSums() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="OTU") %>%
+  summarise(sum=sum(.)) 
+
+# proportion of reads that 10% encompasses
+(top.10 / all.otus) * 100
+
+# import new file post-manual correction
+fun.tax.cor <- read.csv("fun.otu.total_manually-corrected.csv")
+```
+
+Replace corrected taxonomic assignments in taxonomy table
+
+```{r}
+# create df of 90% least abundant ASVs (not manually checked)
+fun.tax.uncor <- fun.tax %>% 
+  filter(OTU %in% fun.otu.list$OTU) %>% 
+  filter(! OTU %in% fun.tax.cor$OTU)
+
+# bind with top 10% of ASVs, which have now been manually checked
+fun.tax.new <- fun.tax.cor %>% 
+  dplyr::select(-c(1,3,12:14)) %>% 
+  rbind(fun.tax.uncor)
+```
+
+
+### Composition and Diversity Analyses
+
+Diversity 
+
+```{r}
+# create data frame for diversity variables
+fun.otu.div <- fun.otu.pots %>% 
+  left_join(pp %>% dplyr::select(pot.code, bm.rate, psf), by="pot.code")
+
+# richness
+fun.otu.div$rich <- specnumber(fun.otu.labeled)
+
+# rarefied richness
+fun.otu.div$rare <- rarefy(fun.otu.matrix, 32762)
+
+# shannon
+fun.otu.div$shannon <- diversity(fun.otu.matrix, index = "shannon")
+
+# evenness 
+fun.otu.div$even <- fun.otu.div$shannon / log(fun.otu.div$rich)
+
+# relationship between raw richness and rarefied richness 
+cor(fun.otu.div$rich, fun.otu.div$rare) # R2 = 0.9989917
+
+ggplot(fun.otu.div) + 
+  geom_abline(slope=1, intercept=0) + 
+  geom_point(aes(x=rich, y=rare), shape=21, color="black", fill="pink", size=3) + 
+  theme_classic() + 
+  ylab("Rarefied Richness") + 
+  xlab("Richness")
+
+# analyze differences among treatment groups
+rich.lm <- lm(rich ~ species * inoculum, data=fun.otu.div)
+Anova(rich.lm)
+
+even.lm <- lm(even ~ species * inoculum, data=fun.otu.div)
+Anova(even.lm)
+
+# analyze relationships with plant performance
+rich.psf <- lm(psf ~ rich, data=fun.otu.div)
+Anova(rich.psf)
+
+ggplot(fun.otu.div) + 
+  geom_point(aes(x=rich, y=psf), size=3) + 
+  geom_smooth(aes(x=rich, y=psf), method="lm") + 
+  theme_classic() + 
+  ylab("Plant Performance") + 
+  xlab("Fungal Richness")
+```
+
+Multidimensional Scaling Analysis
+
+```{r}
+# calculate relative abundance 
+fun.matrix.rel <- decostand(fun.otu.matrix, method = "total")
+
+# calculate dissimilarity matrix 
+fun.matrix.dist <- vegdist(fun.matrix.rel, method = "bray")
+
+# run mds 
+fun.gh.mds <- metaMDS(fun.matrix.dist, distance = "bray", trymax=1000)
+
+# goodness of fit
+stressplot(fun.gh.mds)
+
+# extract MDS values for visualization
+fun.scores <- as.data.frame(vegan::scores(fun.gh.mds))
+
+fun.scores$pot.code = fun.otu.pots$pot.code
+
+fun.scores.meta <- fun.scores %>% 
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  left_join(pp %>% dplyr::select(pot.code, psf, bm.rate), by="pot.code")
+```
+
+Then, without 9F, which we are missing biomass data for, to test how plant performance fits onto composition ordination.
+
+```{r}
+# calculate relative abundance 
+fun.matrix.rel.psf <- decostand(fun.otu.gh %>% 
+                                  arrange(pot.code) %>% 
+                                  filter(pot.code!="9F") %>% 
+                                  dplyr::select(-c(1)), 
+                                method = "total")
+
+fun.otu.rich.psf <- fun.otu.div %>% arrange(pot.code) %>% filter(pot.code!="9F")
+
+# calculate dissimilarity matrix
+fun.matrix.dist.psf <- vegdist(fun.matrix.rel.psf, method = "bray")
+
+# run mds 
+fun.gh.mds.psf <- metaMDS(fun.matrix.dist.psf, distance = "bray", trymax=1000)
+
+# fit relative performance data to mds
+psf.envfit <- envfit(fun.matrix.dist.psf, fun.otu.rich.psf$psf, permutations = 999, na.rm = TRUE)
+
+psf.envfit
+```
+
+Fungal guild
+
+```{r}
+# format df for fun guild assignments
+fun.tax.gh <- fun.tax.new %>% 
+  unite(col = "Taxonomy", 
+        c(Kingdom, Phylum, Class, Order, Family, Genus, Species), 
+        sep = "; ", remove = TRUE) %>% 
+  dplyr::select(OTU, Taxonomy)
+
+# assign guild / trophic mode
+fun.guild.gh <- funguild_assign(fun.tax.gh, db = get_funguild_db(), tax_col = "Taxonomy")
+
+# clean guild df
+fun.guild.plot <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, trophicMode, count) %>%
+  mutate(trophicMode = replace_na(trophicMode, "Unknown")) %>% 
+  mutate(trophicMode = replace(trophicMode, trophicMode== " Saprotroph", "Saprotroph")) %>% 
+  mutate(trophicMode = replace(trophicMode, trophicMode== " Pathotroph-Pathotroph-Saprotroph", "Pathotroph-Pathotroph-Saprotroph")) %>% 
+  mutate(trophicMode = replace(trophicMode, trophicMode== " Saprotroph-Saprotroph-Symbiotroph", "Saprotroph-Saprotroph-Symbiotroph")) %>%   group_by(pot.code, trophicMode) %>%
+  summarise(count.sum=sum(count)) %>% 
+  left_join(fun.otu.pots, by="pot.code")
+
+# count total reads per pot
+fun.guild.sum <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, trophicMode, count) %>%
+  group_by(pot.code) %>%
+  summarise(total.count=sum(count))
+
+# calculate relative abundance of each trophic mode in each pot
+fun.guild.rel <- pp %>% 
+  dplyr::select(pot.code, bm.rate, psf, growth.time) %>% 
+  left_join(fun.guild.plot, by="pot.code") %>% 
+  left_join(fun.guild.sum, by="pot.code") %>% 
+  mutate(rel.count = count.sum/total.count)
+
+# analyses 
+
+# extract specific trophic modes
+# saprotrophs
+sap.rel <- fun.guild.rel %>% 
+  filter(trophicMode=="Saprotroph") %>% 
+  remove_missing()
+
+# symbiotrophs
+sym.rel <- fun.guild.rel %>% 
+  filter(trophicMode=="Symbiotroph") %>% 
+  remove_missing()
+
+# pathotrophs
+path.rel <- fun.guild.rel %>% 
+  filter(trophicMode=="Pathotroph") %>% 
+  remove_missing()
+
+# extract specific guilds 
+# plant pathogens
+fun.guild.plantpath <- fun.otu.labeled %>%
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, guild, count) %>%
+  group_by(pot.code, guild) %>%
+  summarise(count.sum=sum(count)) %>% 
+  filter(guild=="|Plant Pathogen|") %>% 
+  group_by(pot.code) %>%
+  summarise(plant.path=sum(count.sum)) %>% 
+  left_join(fun.guild.sum, by="pot.code") %>% 
+  left_join(pp, by="pot.code") %>% 
+  mutate(rel.count = plant.path/total.count)
+
+# fungal parasites
+fun.guild.funpar <- fun.otu.labeled %>%
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, guild, count) %>%
+  group_by(pot.code, guild) %>%
+  summarise(count.sum=sum(count)) %>% 
+  filter(guild=="|Fungal Parasite|") %>% 
+  group_by(pot.code) %>%
+  summarise(fun.par=sum(count.sum)) %>% 
+  left_join(fun.guild.sum, by="pot.code") %>% 
+  left_join(pp, by="pot.code") %>% 
+  mutate(rel.count = fun.par/total.count)
+
+# ectomycorrhizae
+fun.guild.ecm <- fun.otu.labeled %>%
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, guild, count) %>%
+  group_by(pot.code, guild) %>%
+  summarise(count.sum=sum(count)) %>% 
+  filter(guild=="Ectomycorrhizal" | guild=="|Ectomycorrhizal|") %>% 
+  group_by(pot.code) %>%
+  summarise(ecm=sum(count.sum)) %>% 
+  left_join(fun.guild.sum, by="pot.code") %>% 
+  left_join(pp, by="pot.code") %>% 
+  filter(species=="PITA") %>% 
+  mutate(rel.count = ecm/total.count)
+
+# specific ectomycorrhizal genera
+fun.ecm.gen <- fun.otu.labeled %>%
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU, guild, count) %>%
+  filter(guild=="Ectomycorrhizal" | guild=="|Ectomycorrhizal|") %>% 
+  left_join(fun.tax, by="OTU") %>% 
+  dplyr::select(pot.code, Family, Genus, count) %>% 
+  group_by(pot.code, Family, Genus) %>%
+  summarise(gen.sum=sum(count)) %>% 
+  left_join(pp, by="pot.code")
+
+# count number of unique ectomycorrhizal ASVs
+fun.otu.labeled %>%
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU, guild, count) %>%
+  filter(guild=="Ectomycorrhizal" | guild=="|Ectomycorrhizal|") %>% 
+  dplyr::select(OTU) %>% 
+  unique() %>% 
+  count() 
+
+# specific ectomycorrhizal genera by treatment
+fun.ecm.treat <- fun.ecm.gen %>% 
+  group_by(inoculum, Genus) %>% 
+  summarize(sum=sum(gen.sum))
+
+# arbuscular mycorrhizae
+fun.guild.am <- fun.otu.gh %>%
+  gather("OTU", "count", 2:8679) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, guild, count) %>%
+  group_by(pot.code, guild) %>%
+  summarise(count.sum=sum(count)) %>% 
+  filter(str_detect(guild, "Arbusc")) %>%
+  group_by(pot.code) %>%
+  summarise(am=sum(count.sum)) %>% 
+  left_join(fun.guild.sum, by="pot.code") %>% 
+  left_join(pp, by="pot.code") %>% 
+  mutate(rel.count = am/total.count)
+
+# count unique arbuscular mycorrhizal ASVs
+fun.otu.gh %>%
+  gather("OTU", "count", 2:8679) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, OTU,Taxonomy, guild, count) %>%
+  filter(str_detect(guild, "Arbusc")) %>% 
+  dplyr::select(OTU) %>% 
+  unique() %>% 
+  count()
+  
+# dark septate endophytes
+fun.dse <- fun.otu.labeled %>%
+  gather("OTU", "count", 2:1114) %>% 
+  left_join(fun.otu.pots %>% dplyr::select(pot.code, species, inoculum), by="pot.code") %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  dplyr::select(pot.code, species, inoculum, OTU, Taxonomy, guild, count, trophicMode, notes) %>%
+  filter(grepl('Dark Septate', notes)) %>% 
+  filter(count!=0)
+
+# dse abundance by pot
+fun.dse.count <- fun.dse %>% 
+  group_by(pot.code) %>% 
+  dplyr::select(pot.code, count) %>% 
+  summarise(count=sum(count)) %>% 
+  filter(pot.code!="6A") %>% 
+  left_join(fun.guild.sum, by="pot.code") %>% 
+  left_join(pp, by="pot.code") %>% 
+  mutate(rel.count = count/total.count)
+
+# count unique dse ASVs
+fun.dse %>% 
+dplyr::select(OTU) %>% 
+  unique() %>% 
+  count() 
+
+# build models 
+
+# symbiotrophs
+# performance and relative abundance 
+sym.psf.lm <- lm(psf~rel.count * species, data=sym.rel)
+summary(sym.psf.lm)
+
+# relative abundance and treatment group
+waldtest(betareg(rel.count ~ species, data=sym.rel))
+waldtest(betareg(rel.count ~ inoculum, data=sym.rel))
+waldtest(betareg(rel.count ~ species*inoculum, data=sym.rel))
+
+sym.br <- betareg(rel.count ~ species*inoculum, data=sym.rel)
+Anova(betareg(rel.count ~ species*inoculum, data=sym.rel)) # wald chi square
+
+# post hoc test
+sym.rg <- ref.grid(sym.br)        
+sym.lsm = lsmeans(sym.rg, ~ species*inoculum)
+cld(sym.lsm, alpha =  0.05)
+
+# ectomycorrhizae 
+# performance and relative abundance 
+ecm.psf.lm <- lm(psf~rel.count, data=fun.guild.ecm)
+summary(ecm.psf.lm)
+
+# relative abundance and treatment group
+waldtest(betareg(rel.count ~ inoculum, data=fun.guild.ecm))
+ecm.br <- betareg(rel.count ~ inoculum, data=fun.guild.ecm)
+
+# post hoc test
+ecm.rg <- ref.grid(ecm.br)        
+ecm.lsm = lsmeans(ecm.rg, ~ inoculum)
+cld(ecm.lsm, alpha =  0.05)
+
+# arbuscular mycorrhizae
+# performance and relative abundance 
+am.psf.lm <- lm(psf~rel.count, data=fun.guild.am %>% filter(species=="ILGL"))
+summary(am.psf.lm)
+
+# relative abundance and treatment group
+# beta regression does not work for this model, using LM
+am.count <- lm(rel.count ~ inoculum, data=fun.guild.am %>% filter(species=="ILGL"))
+Anova(am.count)
+
+# post-hoc test
+am.count.aov <- aov(am.count)
+TukeyHSD(am.count.aov, conf.level=0.95)
+
+# dark septate endophytes
+# performance and relative abundance 
+dse.psf.lm <- lm(psf~rel.count, data=fun.dse.count)
+summary(dse.psf.lm)
+
+# relative abundance and treatment group
+waldtest(betareg(rel.count ~ species, data=fun.dse.count))
+waldtest(betareg(rel.count ~ inoculum, data=fun.dse.count))
+waldtest(betareg(rel.count ~ species*inoculum, data=fun.dse.count))
+
+dse.br <- betareg(rel.count ~ species*inoculum, data=fun.dse.count)
+Anova(betareg(rel.count ~ species*inoculum, data=fun.dse.count)) # wald chi square
+
+# post hoc test
+dse.rg <- ref.grid(dse.br)        
+dse.lsm = lsmeans(dse.rg, ~ species*inoculum)
+cld(dse.lsm, alpha =  0.05)
+
+# total pathotrophs
+# performance and relative abundance 
+path.psf.lm <- lm(psf~rel.count, data=path.rel)
+summary(path.psf.lm)
+
+# relative abundance and treatment group
+waldtest(betareg(rel.count ~ species, data=path.rel))
+waldtest(betareg(rel.count ~ inoculum, data=path.rel))
+waldtest(betareg(rel.count ~ species*inoculum, data=path.rel))
+
+path.br <- betareg(rel.count ~ species * inoculum, data=path.rel)
+Anova(betareg(rel.count ~ species*inoculum, data=path.rel)) # wald chi square
+
+# post hoc test
+path.rg <- ref.grid(path.br)        
+path.lsm = lsmeans(path.rg, ~ species*inoculum)
+cld(path.lsm, alpha =  0.05)
+
+# plant pathogens
+# performance and relative abundance 
+plantpath.psf.lm <- lm(psf~rel.count, data=fun.guild.plantpath)
+summary(plantpath.psf.lm)
+
+# relative abundance and treatment group
+plantpath.count <- lm(rel.count ~ species*inoculum, data=fun.guild.plantpath)
+summary(plantpath.count)
+
+# fungal parasites
+# performance and relative abundance 
+funpar.psf.lm <- lm(psf~rel.count, data=fun.guild.funpar)
+summary(funpar.psf.lm)
+
+# relative abundance and treatment group
+funpar.count <- lm(rel.count ~ species*inoculum, data=fun.guild.funpar)
+summary(funpar.count)
+
+# saprotrophs
+# performance and relative abundance 
+sap.psf.lm <- lm(psf~rel.count, data=sap.rel)
+summary(sap.psf.lm)
+
+# relative abundance and treatment group
+waldtest(betareg(rel.count ~ species, data=sap.rel))
+waldtest(betareg(rel.count ~ inoculum, data=sap.rel))
+waldtest(betareg(rel.count ~ species*inoculum, data=sap.rel))
+
+sap.br <- betareg(rel.count ~ species*inoculum, data=sap.rel)
+Anova(betareg(rel.count ~ species*inoculum, data=sap.rel)) # wald chi square
+
+# post hoc test
+sap.rg <- ref.grid(sap.br)        
+sap.lsm = lsmeans(sap.rg, ~ species*inoculum)
+cld(sap.lsm, alpha =  0.05)
+```
+
+### Create figure of composition, diversity, and trophic mode abundance (Figure 3).
+
+```{r}
+# create color palette
+psf.bw <- c("Forest"="gray30", "Shrub"="gray", "Sterile"="gray95")
+
+# create guild data frame that includes dse assignments
+troph.fig <- fun.guild.rel %>% 
+  filter(trophicMode=="Saprotroph" | 
+           trophicMode=="Pathotroph" |
+           trophicMode=="Symbiotroph") %>% 
+  dplyr::select(pot.code, species, inoculum, trophicMode, rel.count) %>% 
+  rbind(fun.dse.count %>% 
+          mutate(trophicMode = "DSE") %>% 
+          dplyr::select(pot.code, species, inoculum, trophicMode, rel.count))
+
+# nmds 
+fun.mds <- ggplot(fun.scores.meta, aes(x=NMDS1, y=NMDS2)) +
+  stat_ellipse(aes(fill=inoculum), geom = "polygon", color="black", alpha=0.5) + 
+  geom_point(aes(shape=species, fill=inoculum), color="black", size=3) + 
+  theme_classic() + 
+  scale_shape_manual(values=c(21,24,22)) + 
+  scale_fill_manual(values=psf.bw) + 
+  xlab("NMDS 1") + 
+  ylab("NMDS 2") + 
+  guides(fill = guide_legend(override.aes = list(shape=21)))
+
+# richness across species X inocula
+fun.rich <- ggplot(fun.otu.div) + 
+  geom_boxplot(aes(y=rich, x=species, fill=inoculum)) + 
+  theme_classic() + 
+  scale_fill_manual(values=psf.bw) + 
+  ylab("Richness")
+
+# evenness across species X inocula
+fun.even <- ggplot(fun.otu.div) + 
+  geom_boxplot(aes(y=even, x=species, fill=inoculum)) + 
+  theme_classic() + 
+  scale_fill_manual(values=psf.bw) + 
+  ylab("Evenness")
+
+# relative abundance of trophic modes across species x inocula
+troph <- ggplot(troph.fig %>% 
+                  mutate(rel.count = replace(rel.count, 
+                                             trophicMode=="Pathotroph" & rel.count>0.4, NA)), 
+                aes(x=inoculum, y=rel.count)) + 
+  geom_boxplot(aes(fill=inoculum)) +
+  theme_classic() + 
+  xlab("Inoculum") + 
+  ylab("Relative Abundance") + 
+  scale_fill_manual(values=psf.bw) + 
+  theme(legend.position="NONE", 
+        panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank()) + 
+  facet_grid(rows=vars(trophicMode), cols=vars(species), scale="free_y")
+
+# combine composition and richness plots for top row
+comp.rich <- ggarrange(fun.mds, fun.rich, fun.even,
+                       nrow=1, ncol=3, common.legend=TRUE, labels=c("A","B","C"))
+
+# add trophic mode plot below
+comp.rich.troph <- ggarrange(comp.rich, troph, 
+                             nrow=2, ncol=1, heights=c(1,1.5), labels=c("","D"))
+comp.rich.troph 
+
+# save
+ggsave("comp.rich.troph.png", dpi=600, width=7, height=7, plot=comp.rich.troph)
+
+```
+
+
+### Visualize Fungal Phyla (with and without Sterile ASVs)
+
+First, build data frames for each species to summarize the relative abundance of each Phylum, including sterile ASVs.
+
+```{r}
+# create data frame of treatment data and ASV abundance
+fun.otu.abun <- fun.otu.labeled %>%
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>%
+  dplyr::select(pot.code, species, inoculum, OTU, abun)
+
+fun.phy.sum <- fun.otu.abun %>% 
+  left_join(fun.tax) %>% 
+  group_by(Phylum) %>% 
+  summarise(sum=sum(abun)) %>% 
+  mutate(total=sum(sum)) %>% 
+  mutate(per = (sum / total)*100)
+
+# Pinus taeda
+# calculate total sequence reads per treatment group
+pita.fun.reads <- fun.otu.abun %>% 
+  filter(species=="PITA") %>%
+  group_by(inoculum) %>%
+  summarise(total=sum(abun))
+
+# calculate the relative abundance of phyla in each treatment group
+pita.fun.phy <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(species=="PITA") %>%
+  mutate(abun = as.numeric(abun)) %>% 
+  group_by(Phylum, inoculum) %>%
+  summarise(count=sum(abun)) %>% 
+  left_join(pita.fun.reads, by="inoculum") %>% 
+  mutate(rel = (count / total) *100) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Phylum = replace_na(Phylum, "Unknown"))
+
+# Morella cerifera 
+# calculate total sequence reads per treatment group
+moce.fun.reads <- fun.otu.abun %>% 
+  filter(species=="MOCE") %>%
+  group_by(inoculum) %>%
+  summarise(total=sum(abun))
+
+# calculate the relative abundance of phyla in each treatment group
+moce.fun.phy <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(species=="MOCE") %>%
+  mutate(abun = as.numeric(abun)) %>% 
+  group_by(Phylum, inoculum) %>%
+  summarise(count=sum(abun)) %>% 
+  left_join(moce.fun.reads, by="inoculum") %>% 
+  mutate(rel = (count / total) *100) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Phylum = replace_na(Phylum, "Unknown"))
+
+# Ilex glabra 
+# calculate total sequence reads per treatment group
+ilgl.fun.reads <- fun.otu.abun %>% 
+  filter(species=="ILGL") %>%
+  group_by(inoculum) %>%
+  summarise(total=sum(abun))
+
+# calculate the relative abundance of phyla in each treatment group
+ilgl.fun.phy <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(species=="ILGL") %>%
+  mutate(abun = as.numeric(abun)) %>% 
+  group_by(Phylum, inoculum) %>%
+  summarise(count=sum(abun)) %>% 
+  left_join(ilgl.fun.reads, by="inoculum") %>% 
+  mutate(rel = (count / total) *100) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Phylum = replace_na(Phylum, "Unknown"))
+
+# create df of only sterile treatment data
+fun.phy.ster <- pita.fun.phy %>% 
+  dplyr::select(Phylum, inoculum, rel) %>% 
+  filter(inoculum=="Sterile") %>% 
+  mutate(species="PITA") %>% 
+  rbind(ilgl.fun.phy %>% 
+              dplyr::select(Phylum, inoculum, rel) %>% 
+              filter(inoculum=="Sterile") %>% 
+              mutate(species="ILGL")) %>% 
+  rbind(moce.fun.phy %>% 
+              dplyr::select(Phylum, inoculum, rel) %>% 
+              filter(inoculum=="Sterile") %>% 
+              mutate(species="MOCE"))
+```
+
+Next, build data frames for each species without sterile ASVs to summarize the relative abundance of each Phylum only sourced from inoculation. 
+
+```{r}
+# create data frame of treatment data and ASV abundance
+fun.otu.abun.ster <- fun.otu.inoc %>%
+  gather(OTU, abun, 2:741) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  dplyr::select(pot.code, species, inoculum, OTU, abun)
+
+# Pinus taeda
+# calculate total sequence reads per treatment group
+pita.fun.reads.ster <- fun.otu.abun.ster %>% 
+  filter(species=="PITA") %>%
+  group_by(inoculum) %>%
+  summarise(total=sum(abun))
+
+# calculate the relative abundance of phyla in each treatment group
+pita.fun.phy.ster <- fun.otu.inoc %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:741) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(species=="PITA") %>%
+  mutate(abun = as.numeric(abun)) %>% 
+  group_by(Phylum, inoculum) %>%
+  summarise(count=sum(abun)) %>% 
+  left_join(pita.fun.reads.ster, by="inoculum") %>% 
+  mutate(rel = (count / total) *100) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Phylum = replace_na(Phylum, "Unknown"))
+
+# Morella cerifera
+# calculate total sequence reads per treatment group
+moce.fun.reads.ster <- fun.otu.abun.ster %>% 
+  filter(species=="MOCE") %>%
+  group_by(inoculum) %>%
+  summarise(total=sum(abun))
+
+# calculate the relative abundance of phyla in each treatment group
+moce.fun.phy.ster <- fun.otu.inoc %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:741) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(species=="MOCE") %>%
+  mutate(abun = as.numeric(abun)) %>% 
+  group_by(Phylum, inoculum) %>%
+  summarise(count=sum(abun)) %>% 
+  left_join(moce.fun.reads.ster, by="inoculum") %>% 
+  mutate(rel = (count / total) *100) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Phylum = replace_na(Phylum, "Unknown"))
+
+# Ilex glabra 
+# calculate total sequence reads per treatment group
+ilgl.fun.reads.ster <- fun.otu.abun.ster %>% 
+  filter(species=="ILGL") %>%
+  group_by(inoculum) %>%
+  summarise(total=sum(abun))
+
+# calculate the relative abundance of phyla in each treatment group
+ilgl.fun.phy.ster <- fun.otu.inoc %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:741) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(species=="ILGL") %>%
+  mutate(abun = as.numeric(abun)) %>% 
+  group_by(Phylum, inoculum) %>%
+  summarise(count=sum(abun)) %>% 
+  left_join(ilgl.fun.reads.ster, by="inoculum") %>% 
+  mutate(rel = (count / total) *100) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Phylum = replace_na(Phylum, "Unknown"))
+```
+
+### Create and assemble Phylum panels (Figure 4).
+
+```{r}
+# create color palette
+phylum.colors <- c("Ascomycota"="#d40853", 
+                  "Basidiomycota"="#e680a5", 
+                  "Chytridiomycota"="#ffc107", 
+                  "Glomeromycota"="#fbe299",
+                  "Monoblepharomycota"="#0e41d0", 
+                  "Mortierellomycota"="#829fef", 
+                  "Mucoromycota"="#004d40", 
+                  "Rozellomycota"="#81e4d3",
+                  "Unknown"="gray75")
+
+# pinus taeda figure
+pita.phy.fig.ster <- ggplot(pita.fun.phy.ster) + 
+  geom_bar(aes(x=inoculum, y=rel, group=Phylum, fill=Phylum), stat = "identity") + 
+  theme_classic() + 
+  ylab("Relative Abundance") +
+  xlab("Inoculum") + 
+  scale_fill_manual(values=phylum.colors) + 
+  theme(plot.title = element_text(face = "italic"),
+        axis.title.y = element_blank(), 
+        legend.position="NONE") +  
+  ggtitle("Pinus taeda")
+
+# morella cerifera figure
+moce.phy.fig.ster <- ggplot(moce.fun.phy.ster) + 
+  geom_bar(aes(x=inoculum, y=rel, group=Phylum, fill=Phylum), stat = "identity") + 
+  theme_classic() + 
+  xlab("Inoculum") + 
+  scale_fill_manual(values=phylum.colors) + 
+  theme(plot.title = element_text(face = "italic"),
+        axis.title.y = element_blank(), 
+        legend.position="NONE") + 
+  ggtitle("Morella cerifera")
+
+# ilex glabra figure
+ilgl.phy.fig.ster <- ggplot(ilgl.fun.phy.ster) + 
+  geom_bar(aes(x=inoculum, y=rel, group=Phylum, fill=Phylum), stat = "identity") + 
+  theme_classic() + 
+  xlab("Inoculum") + 
+  scale_fill_manual(values=phylum.colors) + 
+  theme(plot.title = element_text(face = "italic"),
+        axis.title.y = element_blank(), 
+        legend.position="NONE") + 
+  ggtitle("Ilex glabra")
+
+# extract legend
+fun.phy.leg.ster <- get_legend(ggplot(ilgl.fun.phy.ster) + 
+  geom_bar(aes(x=inoculum, y=rel, group=Phylum, fill=Phylum), stat = "identity") + 
+  theme_classic() + 
+  xlab("Inoculum") + 
+    scale_fill_manual(values=phylum.colors) + 
+  theme(plot.title = element_text(face = "italic"),
+        axis.title.y = element_blank()))
+
+# create figure of sterile pots 
+ster.pots <- ggplot(fun.phy.ster) + 
+  geom_bar(aes(x=species, y=rel, group=Phylum, fill=Phylum), stat = "identity") + 
+  theme_classic() + 
+  ylab("Relative Abundance") +
+  xlab("Species") + 
+  scale_fill_manual(values=phylum.colors) + 
+  theme(plot.title = element_text(face = "italic"),
+        axis.title.y = element_blank(), 
+        legend.position="NONE") + 
+  ggtitle(" ")
+
+# assemble first row
+row1 <- ggarrange(ilgl.phy.fig.ster, moce.phy.fig.ster, pita.phy.fig.ster, nrow=1, labels=c("A", "B", "C"))
+ 
+# assemble second row
+row2 <- ggarrange(ster.pots, fun.phy.leg.ster, widths=c(2,1), nrow=1)
+
+# combine rows with spacer in between
+phyla.fig <- ggarrange(row1, row2, labels=c("", "D"), nrow=2)
+phyla.fig
+
+# export as .png for manual annotation
+ggsave(plot=phyla.fig, "phyla.png", dpi=600, width=8, height=7)
+```
+
+### Most abundant classes panel (Figure 4)
+
+```{r}
+fam.colors <- c("Mortierellomycetes"="#829fef", 
+           "Cystobasidiomycetes"="#e680a5", 
+           "Sordariomycetes"="#d40853", 
+           "Pezizomycetes"="#d40853", 
+           "Tremellomycetes"="#e680a5", 
+           "Saccharomycetes"="#d40853", 
+           "Leotiomycetes"="#d40853", 
+           "Agaricomycetes"="#e680a5", 
+           "Microbotryomycetes"="#e680a5",  
+           "Dothideomycetes"="#d40853")
+
+# Most abundant classes overall 
+fun.class.top <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  dplyr::select(Class, abun) %>% 
+  group_by(Class) %>% 
+  summarise(sum=sum(abun))
+
+# Total reads per treatment group
+group.reads <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  group_by(species, inoculum) %>% 
+  summarise(total.sum=sum(abun))
+
+# Compute relative abundance for top 8 most abundant 
+fun.class <- fun.otu.labeled %>% 
+  arrange(pot.code) %>% 
+  gather(OTU, abun, 2:1113) %>% 
+  left_join(fun.tax.new, by="OTU") %>%
+  dplyr::select(pot.code, Class, abun) %>% 
+  left_join(fun.otu.pots, by="pot.code") %>% 
+  filter(Class=="c__Mortierellomycetes" | 
+           Class=="c__Cystobasidiomycetes" | 
+           Class=="c__Sordariomycetes" | 
+           Class=="c__Pezizomycetes" | 
+           Class=="c__Tremellomycetes" | 
+           Class=="c__Saccharomycetes" | 
+           Class=="c__Leotiomycetes" | 
+           Class=="c__Agaricomycetes" | 
+           Class=="c__Microbotryomycetes" | 
+           Class=="c__Dothideomycetes") %>% 
+  mutate(Class = str_sub(Class, 4, nchar(Class))) %>% 
+  group_by(species, inoculum, Class) %>%
+  summarise(sum=sum(abun)) %>% 
+  left_join(group.reads, by=c("species", "inoculum")) %>%  
+  mutate(rel.abun = (sum / total.sum))
+
+fun.class$Class <- factor(fun.class$Class, levels = c("Dothideomycetes", "Leotiomycetes", 
+                                                      "Pezizomycetes", "Saccharomycetes", 
+                                                      "Sordariomycetes", "Agaricomycetes", 
+                                                      "Cystobasidiomycetes", 
+                                                      "Microbotryomycetes", "Tremellomycetes", 
+                                                      "Mortierellomycetes"))
+
+class.plot <- ggplot(fun.class) + geom_col(aes(x=interaction(inoculum, species), y=rel.abun*100, fill=Class)) + 
+  scale_fill_manual(values=fam.colors) + 
+  ylab("") + 
+  theme_classic() + 
+  theme(legend.position = "NONE", 
+        axis.text.x = element_blank(), 
+        axis.title.x = element_blank(), 
+        panel.background = element_rect(fill = "transparent", color = NA), 
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) + 
+  facet_wrap(~Class, ncol=1, scales="free")
+class.plot
+
+ggsave(plot=class.plot, "myco.class.png", dpi=600, height=10, width=2.5)
+```
+
+
+### Ectomycorrhizal colonization via visual scoring panels  (Figure 5)
+
+```{r}
+# quantify percent colonization
+myco$per.col = (myco$col / (myco$col + myco$unc))*100
+
+# average colonization per pot
+myco.per <- myco %>% 
+  group_by(pot.code) %>% 
+  summarise(avg.col=mean(percent.col, na.rm=TRUE)) %>% 
+  left_join(pp) %>% 
+  right_join(fun.guild.ecm %>% 
+              dplyr::select(pot.code, rel.count), by="pot.code")
+
+# test relationship with relative abundance of ecto sequence reads
+myco.seq <- lm(rel.count ~ avg.col, data=myco.per)
+summary(myco.seq)
+
+# test relationship with plant performance
+col.pp <- lm(psf~avg.col, data=myco.per)
+summary(col.pp)
+```
+
+### Mycorrhizae sequencing panels + Assemble (Figure 5)
+
+```{r}
+# ECM sequence read abundance across treatments
+ecm.seq.treat <- ggplot(myco.per) + 
+  geom_boxplot(aes(x=inoculum, y=rel.count*100, fill=inoculum)) + 
+  scale_fill_manual(values=psf.bw) + 
+  ylab("Seq Read Abun") + 
+  xlab("Inoculum") + 
+  theme_classic() + 
+  ggtitle(" ")
+
+# ECM colonization across treatments
+ecm.col.treat <- ggplot(myco.per) + 
+  geom_boxplot(aes(x=inoculum, y=avg.col, fill=inoculum)) + 
+  scale_fill_manual(values=psf.bw) + 
+  ylab("Scored % Col") + 
+  xlab("Inoculum") + 
+  theme_classic() + 
+  ggtitle(" ")
+
+# relationship between ECM sequence reads and visually-scored colonization
+col.seq <- ggplot(myco.per, aes(x=avg.col, y=rel.count*100)) + 
+  geom_point(color="black", size=3) + 
+  annotate("text", label="R2=0.4794", x=50, y=80) + 
+  geom_smooth(method="lm", se=FALSE, color="black") + 
+  ylim(0,100) + 
+  ylab("Seq Read Abun") + xlab("Scored % Col") + 
+  theme_classic() + 
+  ggtitle(" ")
+
+# relationship between ECM abundance and plant performance
+pp.ecm <- ggplot(myco.per) + 
+  geom_smooth(aes(x=rel.count*100, y=psf, color="Seq Read Abun"), 
+              method="lm", alpha=.25, linetype="dashed") + 
+  geom_smooth(aes(x=avg.col, y=psf, color="Scored % Col"), 
+  method="lm", alpha=.25, linetype="dashed") + 
+  geom_point(aes(x=rel.count*100, y=psf, color="Seq Read Abun"), size=3) + 
+  geom_point(aes(x=avg.col, y=psf, color="% Col"), size=3) + 
+  theme_classic() + 
+  ylab("Rel Performance") + 
+  theme(axis.title.x=element_blank()) + 
+  scale_color_manual(
+        name = "Variable", 
+        values = c("Scored % Col" = "gray70", "Seq Read Abun" = "black"),
+        labels = c("Scored % Col", "Seq Read Abun")) + 
+  ggtitle("") + 
+  annotate("text", label="P=0.8693", x=80, y=0.9, color="gray70") + 
+  annotate("text", label="P=0.4214", x=80, y=0.7, color="black")
+
+# AM abundance across treatments
+am.seq.treat <- ggplot(fun.guild.am %>% filter(species=="ILGL")) + 
+  geom_boxplot(aes(x=inoculum, y=rel.count*100, fill=inoculum)) + 
+  scale_fill_manual(values=psf.bw) + 
+  ylab("Seq Read Abun") + 
+  xlab("Inoculum") + 
+  theme_classic() + 
+  ggtitle(" ")
+
+# relationship between AM abundance and plant performance
+pp.am <- ggplot(fun.guild.am %>% filter(species=="ILGL")) + 
+  geom_smooth(aes(x=rel.count*100, y=psf),  
+             color="black", method="lm", alpha=.25, linetype="solid") + 
+  geom_point(aes(x=rel.count*100, y=psf), color="black", size=3) + 
+  theme_classic() + 
+  ylab("Rel Performance") + 
+  theme(axis.title.x=element_blank()) + 
+  ggtitle("") + 
+  annotate("text", label="P=0.0065", x=13, y=1.7, color="black")
+
+# assemble into one figure
+myco.row1 <- ggarrange(am.seq.treat, ecm.seq.treat, ecm.col.treat, col.seq, 
+                       common.legend=TRUE, legend="bottom", nrow=1, 
+                       labels=c("A", "B", "C", "D"))
+
+myco.row2 <- ggarrange(pp.am, pp.ecm, 
+                       common.legend=TRUE, legend="bottom", labels=c("E","F"))
+
+myco.fig <- ggarrange(myco.row1, myco.row2, nrow=2)
+myco.fig
+
+# save and annotate headings outside of R
+ggsave(plot=myco.fig, "myco.figure.png", dpi=600, width=7, height=5)
+```
+
+
+### Random Forest Models
+
+Prepare data 
+
+```{r}
+# filter out ASVs with abundance <0.001 
+# determine what value represents relative abundance of 0.001  
+sum(fun.guild.sum$total.count) # sum of all seq reads = 3696664  
+0.001 * 4194981 # 0.0001% of total seq reads = 369.6664
+
+# select only ASVs with greater than 0.0001% (rounding to the nearest whole #)
+fun.rf <- fun.otu.matrix[colSums(fun.otu.matrix)>4195] 
+# 127 ASVs remain
+
+# create AVS table of selected ASVs with pot code labels
+fun.rf.otu <- fun.otu.pots %>% 
+  dplyr::select(pot.code) %>% 
+  arrange(pot.code) %>% 
+  cbind(fun.rf)
+```
+
+Run model for each species. First, Pinus taeda. 
+
+```{r}
+# create metadata df with only PITA 
+pita.metadata.rf <- fun.otu.pots %>% 
+  dplyr::select(pot.code) %>%
+  left_join(pp, by="pot.code") %>% 
+  dplyr::select(pot.code, species, inoculum, psf, bm.rate) %>% 
+  filter(species=="PITA") %>% 
+  arrange(pot.code)
+
+# create otu table with only PITA
+pita.fun.rf.otu <- pita.metadata.rf %>% 
+  dplyr::select(pot.code) %>% 
+  left_join(fun.rf.otu, by="pot.code") %>% 
+  arrange(pot.code) %>%
+  dplyr::select(-c(1))
+
+# combine psf (response) and ASV table
+pita.fun.rf.all <- pita.metadata.rf %>% 
+  dplyr::select(psf) %>% 
+  cbind(pita.fun.rf.otu) %>% 
+  drop_na(psf)
+
+
+# build random forest model #
+# multiple iterations of model training using a "for" loop 
+# set number of iterations
+n_it <- 100
+
+# create lists to store results
+pita.fun.results <- list()
+pita.fun.importance.list <- list()
+
+for (i in 1:n_it) {
+  set.seed(i) # set a different seed for each iteration
+  
+  # split data into training and testing sets
+  pita.fun.train <- sample(nrow(sample_data(pita.fun.rf.all)), size = nrow(sample_data(pita.fun.rf.all))*0.7)
+  pita.fun.training <- pita.fun.rf.all[pita.fun.train,]
+  pita.fun.testing <- pita.fun.rf.all[-pita.fun.train,]
+  
+  # train the model
+  pita.fun.rf.model3 <- randomForest(psf ~ ., data = pita.fun.training, importance=TRUE, ntree = 500, mtry = sqrt(ncol(pita.fun.training) - 1))
+  
+  # make predictions on the test set
+  predictions <- predict(pita.fun.rf.model3, newdata = pita.fun.testing)
+  
+  # evaluate performance
+  # store model output
+  pita.fun.results[[i]] <- pita.fun.rf.model3
+  
+  # extract variable importance
+  # type=2 for IncNodePurity
+  pita.fun.importance <- importance(pita.fun.rf.model3, type=2)
+  
+  # convert to list
+  pita.fun.importance.list[[i]] <- pita.fun.importance
+
+} # consider weighting importance by model performance 
+
+# extract importance values from each list and combine into single matrix
+# each column is a model iteration
+pita.fun.importance.df <- do.call(cbind, lapply(pita.fun.importance.list, function(x) x[, 1]))
+
+# calculate correlation of ASVs with psf values 
+# to use for filtering out low-correlations ASVs
+pita.fun.cor <- pita.fun.rf.all %>% 
+  drop_na(psf) %>% 
+  correlate() %>% 
+  focus(psf) %>% 
+  rename("OTU"="term") %>%
+  rename("corr"="psf")
+
+# sanity check 
+cor(pita.fun.rf.all$psf, pita.fun.rf.all$OTU0001)
+
+# calculate mean importance values for each ASV
+pita.fun.imp.sum <-pita.fun.importance.df %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="OTU") %>% 
+  pivot_longer(cols=c(2:101), names_to="Iteration", values_to="Importance") %>% 
+  group_by(OTU) %>% 
+  summarise(Mean.Importance=mean(Importance)) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  left_join(fun.tax, by="OTU") %>% 
+  filter(Mean.Importance>0) %>% # filter out any variables (OTUs) with 0 importance
+  left_join(pita.fun.cor, by="OTU") %>% 
+  filter(corr>=0.30 | corr<=-0.30) # filter out anything under 0.30 R2
+
+# are importance and correlation coefficient related?
+ggplot(pita.fun.imp.sum) + 
+  geom_point(aes(x=abs(corr), y=Mean.Importance)) + 
+  theme_classic() + 
+  ylab("Mean Importance") + 
+  xlab("Absolute Correlation")
+
+# determine 80% quantile cut off (to select only the top 20% most important)
+pita.quant <- quantile(pita.fun.imp.sum$Mean.Importance, probs=0.80) 
+pita.quant
+
+# filter out lower 80%
+pita.fun.imp.80 <- pita.fun.imp.sum %>% 
+  filter(Mean.Importance>pita.quant)
+
+# sanity check
+# create df with individual pot reads for all important ASVs
+pita.fun.imp.80.long <- pita.metadata.rf %>% 
+  drop_na(psf) %>% 
+  cbind(pita.fun.rf.all) %>% 
+  pivot_longer(cols=c(6:128), names_to="OTU", values_to="reads") %>% 
+  filter(OTU %in% pita.fun.imp.80$OTU)
+
+# visually inspect data for quality control
+# plot important ASVs and psf values 
+# identify patterns driven by only 1-2 pots
+ggplot(pita.fun.imp.80.long, aes(x=reads, y=psf)) + 
+  geom_point(aes(color=inoculum)) + 
+  geom_smooth(method="lm") + 
+  facet_wrap(vars(OTU), scales="free")
+
+# visualize data distribution by inoculum 
+ggplot(pita.fun.imp.80.long, aes(x=inoculum, y=reads)) + 
+  geom_boxplot(aes(color=inoculum)) + 
+  facet_wrap(vars(OTU), scales="free")
+```
+
+Morella cerifera 
+
+```{r}
+# create metadata df with only MOCE #
+moce.metadata.rf <- fun.otu.pots %>% 
+  dplyr::select(pot.code) %>%
+  left_join(pp, by="pot.code") %>% 
+  dplyr::select(pot.code, species, inoculum, psf, bm.rate) %>% 
+  filter(species=="MOCE") %>% 
+  arrange(pot.code)
+
+# create otu table with only PITA
+moce.fun.rf.otu <- moce.metadata.rf %>% 
+  dplyr::select(pot.code) %>% 
+  left_join(fun.rf.otu) %>% 
+  arrange(pot.code) %>%
+  dplyr::select(-c(1))
+
+# combine psf (response) and ASV table
+moce.fun.rf.all <- moce.metadata.rf %>% 
+  dplyr::select(psf) %>% 
+  cbind(moce.fun.rf.otu) %>% 
+  drop_na(psf)
+
+# set number of iterations
+n_it <- 100
+
+# create lists to store results
+moce.fun.results <- list()
+moce.fun.importance.list <- list()
+
+for (i in 1:n_it) {
+  set.seed(i) # set a different seed for each iteration
+  
+  # split data into training and testing sets
+  moce.fun.train <- sample(nrow(sample_data(moce.fun.rf.all)), size = nrow(sample_data(moce.fun.rf.all))*0.7)
+  moce.fun.training <- moce.fun.rf.all[moce.fun.train,]
+  moce.fun.testing <- moce.fun.rf.all[-moce.fun.train,]
+  
+  # train the model
+  moce.fun.rf.model3 <- randomForest(psf ~ ., data = moce.fun.training, importance=TRUE, ntree = 500, mtry = sqrt(ncol(moce.fun.training) - 1))
+  
+  # make predictions on the test set
+  predictions <- predict(moce.fun.rf.model3, newdata = moce.fun.testing)
+  
+  # evaluate performance
+  # store model output
+  moce.fun.results[[i]] <- moce.fun.rf.model3 # Or performance metrics
+  
+  # extract variable importance
+  # type=2 for IncNodePurity
+  moce.fun.importance <- importance(moce.fun.rf.model3, type=2)
+  
+  # convert to list
+  moce.fun.importance.list[[i]] <- moce.fun.importance
+
+}
+
+# extract importance values from each list and combine into single matrix
+# each column is a model iteration
+moce.fun.importance.df <- do.call(cbind, lapply(moce.fun.importance.list, function(x) x[, 1]))
+
+# calculate correlation of ASVs with psf values 
+# to use for filtering out low-correlations ASVs
+moce.fun.cor <- moce.fun.rf.all %>% 
+  drop_na(psf) %>% 
+  correlate() %>% 
+  focus(psf) %>% 
+  rename("OTU"="term") %>%
+  rename("corr"="psf")
+
+# sanity check 
+cor(moce.fun.rf.all$psf, moce.fun.rf.all$OTU0001) # matches (0.010288315)
+
+# Calculate mean importance values for each OTU and filter
+moce.fun.imp.sum <-moce.fun.importance.df %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="OTU") %>% 
+  pivot_longer(cols=c(2:101), names_to="Iteration", values_to="Importance") %>% 
+  group_by(OTU) %>% 
+  summarise(Mean.Importance=mean(Importance)) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  left_join(fun.tax, by="OTU") %>% 
+  filter(Mean.Importance>0) %>% 
+  left_join(moce.fun.cor, by="OTU") %>% 
+  filter(corr>=0.30 | corr<=-0.30)
+
+# are importance and correlation coefficient related?
+ggplot(moce.fun.imp.sum) + 
+  geom_point(aes(x=abs(corr), y=Mean.Importance)) + 
+  theme_classic() + 
+  ylab("Mean Importance") + 
+  xlab("Absolute Correlation")
+
+# determine 80% quantile cut off (to select only the top 20% most important)
+moce.quant <- quantile(moce.fun.imp.sum$Mean.Importance, probs=0.80) 
+moce.quant
+
+# filter out lower 80% 
+moce.fun.imp.80 <- moce.fun.imp.sum %>% 
+  filter(Mean.Importance>moce.quant)
+
+# sanity check
+# create df with individual pot reads for all important ASVs
+moce.fun.imp.80.long <- moce.metadata.rf %>% 
+  drop_na(psf) %>% 
+  cbind(moce.fun.rf.all) %>% 
+  pivot_longer(cols=c(6:128), names_to="OTU", values_to="reads") %>% 
+  filter(OTU %in% moce.fun.imp.80$OTU)
+
+# visually inspect data for quality control
+# plot important ASVs and psf values 
+# identify any patterns driven by only 1-2 pots
+ggplot(moce.fun.imp.80.long, aes(x=log(reads), y=psf)) + 
+  geom_point(aes(color=inoculum)) + 
+  geom_smooth(method="lm") + 
+  facet_wrap(vars(OTU), scales="free")
+
+# visualize data distribution by inoculum
+ggplot(moce.fun.imp.80.long, aes(x=inoculum, y=reads)) + 
+  geom_boxplot(aes(color=inoculum)) + 
+  facet_wrap(vars(OTU), scales="free")
+```
+
+Ilex glabra
+
+```{r}
+# create metadata df with only ILGL #
+ilgl.metadata.rf <- fun.otu.pots %>% 
+  dplyr::select(pot.code) %>%
+  left_join(pp, by="pot.code") %>% 
+  dplyr::select(pot.code, species, inoculum, psf, bm.rate) %>% 
+  filter(species=="ILGL") %>% 
+  arrange(pot.code)
+
+# create otu table with only ILGL
+ilgl.fun.rf.otu <- ilgl.metadata.rf %>% 
+  dplyr::select(pot.code) %>% 
+  left_join(fun.rf.otu) %>% 
+  arrange(pot.code) %>%
+  dplyr::select(-c(1))
+
+# combine psf (response) and ASV table
+ilgl.fun.rf.all <- ilgl.metadata.rf %>% 
+  dplyr::select(psf) %>% 
+  cbind(ilgl.fun.rf.otu) %>% 
+  drop_na(psf)
+
+# set number of iterations
+n_it <- 100
+
+# create lists to store results
+ilgl.fun.results <- list()
+ilgl.fun.importance.list <- list()
+
+for (i in 1:n_it) {
+  set.seed(i) # set a different seed for each iteration
+  
+  # split data into training and testing sets
+  ilgl.fun.train <- sample(nrow(sample_data(ilgl.fun.rf.all)), size = nrow(sample_data(ilgl.fun.rf.all))*0.7)
+  ilgl.fun.training <- ilgl.fun.rf.all[ilgl.fun.train,]
+  ilgl.fun.testing <- ilgl.fun.rf.all[-ilgl.fun.train,]
+  
+  # train the model
+  ilgl.fun.rf.model3 <- randomForest(psf ~ ., data = ilgl.fun.training, importance=TRUE, ntree = 500, mtry = sqrt(ncol(ilgl.fun.training) - 1))
+  
+  # make predictions on the test set
+  predictions <- predict(ilgl.fun.rf.model3, newdata = ilgl.fun.testing)
+  
+  # evaluate performance
+  # store model output
+  ilgl.fun.results[[i]] <- ilgl.fun.rf.model3 # Or performance metrics
+  
+  # extract variable importance
+  # type=2 for IncNodePurity
+  ilgl.fun.importance <- importance(ilgl.fun.rf.model3, type=2)
+  
+  # convert to lists
+  ilgl.fun.importance.list[[i]] <- ilgl.fun.importance
+  
+}
+
+# extract importance values from each list and combine into single matrix
+# each column is a model iteration
+ilgl.fun.importance.df <- do.call(cbind, lapply(ilgl.fun.importance.list, function(x) x[, 1]))
+
+# calculate correlation of ASVs with psf values 
+# to use for filtering out low-correlations ASVs
+ilgl.fun.cor <- ilgl.fun.rf.all %>% 
+  drop_na(psf) %>% 
+  correlate() %>% 
+  focus(psf) %>% 
+  rename("OTU"="term") %>%
+  rename("corr"="psf")
+
+# sanity check 
+cor(ilgl.fun.rf.all$psf, ilgl.fun.rf.all$OTU0001)
+
+# calculate mean importance values for each ASV
+# filter for importance >0 and correlation > +/-0.30
+ilgl.fun.imp.sum <-ilgl.fun.importance.df %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="OTU") %>% 
+  pivot_longer(cols=c(2:101), names_to="Iteration", values_to="Importance") %>% 
+  group_by(OTU) %>% 
+  summarise(Mean.Importance=mean(Importance)) %>% 
+  left_join(fun.guild.gh, by="OTU") %>% 
+  left_join(fun.tax, by="OTU") %>% 
+  filter(Mean.Importance>0) %>% 
+  left_join(ilgl.fun.cor, by="OTU") %>% 
+  filter(corr>=0.30 | corr<=-0.30)
+
+# are importance and correlation coefficient related?
+ggplot(ilgl.fun.imp.sum) + 
+  geom_point(aes(x=abs(corr), y=Mean.Importance)) + 
+  theme_classic() + 
+  ylab("Mean Importance") + 
+  xlab("Absolute Correlation")
+
+# determine 80% quantile cut off (to select only the top 20% most important)
+ilgl.quant <- quantile(ilgl.fun.imp.sum$Mean.Importance, probs=0.80) 
+ilgl.quant
+
+# filter out lower 80% 
+ilgl.fun.imp.80 <- ilgl.fun.imp.sum %>% 
+  filter(Mean.Importance>ilgl.quant)
+
+# sanity check
+# create df with individual pot reads for all important ASVs
+ilgl.fun.imp.80.long <- ilgl.metadata.rf %>% 
+  drop_na(psf) %>% 
+  cbind(ilgl.fun.rf.all) %>% 
+  pivot_longer(cols=c(6:128), names_to="OTU", values_to="reads") %>% 
+  filter(OTU %in% ilgl.fun.imp.80$OTU)
+
+# visually inspect data for quality control
+# plot important ASVs and psf values 
+# identify any patterns driven by only 1-2 pots
+ggplot(ilgl.fun.imp.80.long, aes(x=reads, y=psf)) + 
+  geom_point(aes(color=inoculum), size=2) + 
+  geom_smooth(method="lm") + 
+  theme_classic() + 
+  facet_wrap(vars(OTU), scales="free")
+
+# visualize data distribution by inoculum 
+ggplot(ilgl.fun.imp.80.long, aes(x=inoculum, y=reads)) + 
+  geom_boxplot(aes(color=inoculum)) + 
+  facet_wrap(vars(OTU), scales="free")
+
+# export combined file to CSV 
+# combine the most important 20% of OTUs from all species into one df
+fun.imp.80 <- pita.fun.imp.80 %>% 
+  mutate(species="PITA") %>%
+  rbind(moce.fun.imp.80 %>% mutate(species="MOCE"), 
+        ilgl.fun.imp.80 %>% mutate(species="ILGL"))
+
+# export as csv
+write.csv(fun.imp.80, "fun.imp.80.csv")
+```
+
+### Random Forest Results Figure (Figure 6)
+
+```{r}
+# calculate mean species importance values
+sp.mean.imp <- fun.imp.80 %>% group_by(species) %>% summarise(mean=mean(Mean.Importance))
+sp.sd.imp <- fun.imp.80 %>% group_by(species) %>% summarise(sd=sd(Mean.Importance))
+
+# summarize by genus
+fun.imp.fig <- fun.imp.80 %>% 
+  dplyr::select(species, Phylum, Order, Genus, Mean.Importance, corr) %>% 
+  mutate(Phylum = str_sub(Phylum, 4, nchar(Phylum))) %>% 
+  mutate(Order = str_sub(Order, 4, nchar(Order))) %>% 
+  mutate(Genus = str_sub(Genus, 4, nchar(Genus))) %>% 
+  drop_na(Genus) %>% 
+  mutate(Phylum = forcats::fct_rev(Phylum)) %>% 
+  mutate(Order = forcats::fct_rev(Order)) %>% 
+  mutate(Genus = forcats::fct_rev(Genus)) %>% 
+  left_join(sp.mean.imp, by="species") %>% 
+  left_join(sp.sd.imp, by="species") %>% 
+  mutate(rel.imp = ((Mean.Importance - mean) / sd) + 1.43)
+
+# plot important ASVs and order taxonomically 
+fun.imp.plot <- ggplot(fun.imp.fig, aes(x=species, y=interaction(Genus, Order, Phylum))) + 
+  geom_point(aes(size=rel.imp, color=corr)) + 
+  scale_color_gradient2(high = "#075AFF",
+                       mid = "#FFFFCC",
+                       low = "#FF0000") + 
+  scale_size_continuous(breaks=c(0.5, 1, 1.5, 2))
+fun.imp.plot
+
+# save and annotate outside of R
+ggsave(plot=fun.imp.plot, "Fungal Importance Figure.png", dpi=500, width=8, height=5)
+
+## positive- and negative-growth associated "important" ASVs by species and treatment
+fun.imp.80.dir <- fun.otu.pots %>% 
+  dplyr::select(pot.code) %>%
+  left_join(pp, by="pot.code") %>% 
+  dplyr::select(pot.code, species, inoculum, psf, bm.rate) %>% 
+  arrange(pot.code) %>% 
+  cbind(fun.rf) %>% 
+  pivot_longer(cols=c(6:127), names_to="OTU", values_to="reads") %>% 
+  filter(OTU %in% fun.imp.80$OTU) %>% 
+  left_join(fun.imp.80 %>% dplyr::select(OTU, Mean.Importance, corr, species), by=c("OTU","species")) %>% 
+  drop_na(corr) %>% 
+  mutate(dir=if_else(corr > 0, "pos", "neg")) %>% 
+  dplyr::select(OTU, species, inoculum, corr, reads, dir) %>% 
+  unique() %>% 
+  group_by(species, inoculum, OTU, corr, dir) %>% 
+  summarise(read.sum=sum(reads)) %>% 
+  group_by(OTU) %>% top_n(1, read.sum)
+
+# plot abundance of important ASVs per group
+imp.dir <- ggplot(fun.imp.80.dir) + 
+  geom_col(aes(x=inoculum, y=log(read.sum), group=dir, fill=dir), ) + 
+  theme_classic() + 
+  scale_fill_manual(values=c("#f16e3f","#295dfe"), name="Correlation", labels=c("Negative", "Positive")) + 
+  ylab("Log(Read Abundance)") + 
+  xlab("Treatment") + 
+  facet_wrap(~ species)
+
+imp.dir
+
+ggsave(plot=imp.dir, "Important.Fungi.Direction.png", dpi=600, width=6.5, height=2)
+```

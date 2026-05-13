@@ -1,0 +1,377 @@
+---
+title: "Plant Performance Analyses"
+author: "Aeran Coughlin"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+This R Markdown file contains the plant performance analyses employed for the manuscript "Microbial assemblages of coastal forested wetland soil promote growth of expanding woody shrub" by Coughlin & Wright. 
+
+### Load Packages and Data Files
+```{r}
+# packages
+library(tidyverse)
+library(car)
+library(lubridate)
+library(ggpubr)
+library(rstatix)
+library(betareg)
+
+# raw data
+germ <- read.csv("Data/PSF-exp-2022_germ-select.csv")
+growth <- read.csv("Data/PSF-exp-2022_growth.csv")
+bm <- read.csv("Data/PSF-exp-2022_biomass.csv")
+germ <- read.csv("Data/PSF-exp-2022_germ-select.csv")
+germ.all <- read.csv("Data/PSF-exp-2022_germ-all.csv")
+pots <- read.csv("Data/PSF-exp-2022_pot-data.csv")
+pots[pots=="MYCE"]<-"MOCE"
+germ[germ=="MYCE"]<-"MOCE"
+```
+
+### Calculate growth and relative performance
+
+```{r}
+# get julian day of biomass harvest
+x <- as.Date('2022-09-12')
+yday(x)
+
+# calculate growth time
+start <- germ %>% select(pot.code, species, inoculum, select.date) 
+start$germ.julian <- yday(as.Date(start$select.date))
+grow <- growth %>% left_join(start, by="pot.code")
+grow$growth.time <- 255 - grow$germ.julian
+
+bm.grow.psf <- left_join(bm, grow, by="pot.code") %>% 
+  left_join(pots %>% select(pot.code, treatment, tray, cell), by="pot.code") %>% 
+  mutate(agb.rate=stem.dry.bm / growth.time) %>% 
+  mutate(bgb.rate=root.dry.bm / growth.time) %>% 
+  mutate(nod.rate=nodule.mass / growth.time) %>% 
+  mutate(rs.ratio=root.dry.bm / stem.dry.bm) %>%
+  mutate(bm.rate=total.bm / growth.time) %>% 
+  mutate(rel.nod=nodule.mass / total.bm) %>% 
+  mutate(rel.root.nod=nodule.mass / total.bm) %>% 
+  mutate(inoc.type=ifelse(inoculum=="Sterile", "Uninoculated", "Inoculated")) %>% 
+  group_by(species) %>% 
+  drop_na(bm.rate) %>% 
+  mutate(sp.avg=mean(bm.rate)) %>% 
+  ungroup() %>% 
+  mutate(psf=(bm.rate - sp.avg) / sp.avg)
+```
+
+### Calculate PSF index
+
+```{r}
+# PITA 
+pita.psf <- bm.grow.psf %>% 
+  filter(species=="PITA") %>% 
+  filter(inoculum!="Sterile") %>% 
+  select(pot.code, inoculum, bm.rate) %>% 
+  pivot_wider(names_from="inoculum", values_from="bm.rate") %>% 
+  select(-pot.code)
+
+pita.psf.matrix <- outer(pita.psf$Forest, pita.psf$Shrub, `-`)
+
+pita.psf.list <- pita.psf.matrix %>% 
+  as.data.frame() %>% 
+  pivot_longer(names_to="it", cols=c(1:12)) %>% 
+  select(value) %>% 
+  drop_na()
+
+mean(pita.psf.list$value)
+sd(pita.psf.list$value)
+
+# MOCE
+moce.psf <- bm.grow.psf %>% 
+  filter(species=="MOCE") %>% 
+  filter(inoculum!="Sterile") %>% 
+  select(pot.code, inoculum, bm.rate) %>% 
+  pivot_wider(names_from="inoculum", values_from="bm.rate") %>% 
+  select(-pot.code)
+
+moce.psf.matrix <- outer(moce.psf$Shrub, moce.psf$Forest, `-`)
+
+moce.psf.list <- moce.psf.matrix %>% 
+  as.data.frame() %>% 
+  pivot_longer(names_to="it", cols=c(1:11)) %>% 
+  select(value) %>% 
+  drop_na()
+
+mean(moce.psf.list$value)
+sd(moce.psf.list$value)
+
+# ILGL
+ilgl.psf <- bm.grow.psf %>% 
+  filter(species=="ILGL") %>% 
+  filter(inoculum!="Sterile") %>% 
+  select(pot.code, inoculum, bm.rate) %>% 
+  pivot_wider(names_from="inoculum", values_from="bm.rate") %>% 
+  select(-pot.code)
+
+ilgl.psf.matrix <- outer(ilgl.psf$Shrub, ilgl.psf$Forest, `-`)
+
+ilgl.psf.list <- ilgl.psf.matrix %>% 
+  as.data.frame() %>% 
+  pivot_longer(names_to="it", cols=c(1:10)) %>% 
+  select(value) %>% 
+  drop_na()
+
+mean(ilgl.psf.list$value)
+sd(ilgl.psf.list$value)
+```
+
+### Quantify germination 
+
+```{r}
+# create germination yes/no binary variable
+germ.yn <- germ.all %>% 
+  mutate(y.n=ifelse(germ.day>0, 1, y.n)) %>% 
+  mutate(y.n = replace_na(y.n, 0))
+
+# calculate percent germination and analyze inoculum effect
+germ.per <- germ %>% select(pot.code,species,inoculum, seeds.planted, seeds.germ)
+germ.per$percent.germ <- (germ.per$seeds.germ / germ.per$seeds.planted)
+germ.per.summ <- germ.per %>% group_by(species,inoculum) %>% summarise(avg=mean(percent.germ))
+
+# par down df an convert dates to julian day
+germ.time <- germ.all %>% 
+  select(pot.code, species, inoculum, plant.date, germ.date) %>% 
+  drop_na(germ.date)
+germ.time$plant.julian <- yday(as.Date(germ.time$plant.date))
+germ.time$germ.julian <- yday(as.Date(germ.time$germ.date))
+
+# calculate days to germination from planting
+germ.time$days.to.germ <- germ.time$germ.julian - germ.time$plant.julian
+
+# average days to germination by group
+germ.time.summ <- germ.time %>% 
+  drop_na(germ.julian) %>% 
+  group_by(species,inoculum) %>% 
+  summarise(avg=mean(days.to.germ))
+```
+
+
+### Testing predictors for assumptions of normality
+
+Source: https://www.datanovia.com/en/lessons/normality-test-in-r/#google_vignette
+
+Shapiro Test - the p-value > 0.05 implies that the distribution of the data are 
+not significantly different from normal distribution.
+
+```{r}
+# growth rate 
+ggdensity(sqrt(bm.grow.psf$bm.rate), fill = "lightgray")
+ggqqplot(bm.grow.psf$bm.rate)
+bm.grow.psf %>%
+  group_by(species) %>%
+  mutate(bm.rate=sqrt(bm.rate)) %>% 
+  shapiro_test(bm.rate)
+# Skewed slightly positive, but only MOCE seems to be non-normal
+# Log transformation makes MOCE meet assumptions of normality 
+
+# germination rate
+ggdensity(germ.per$percent.germ, fill = "lightgray")
+ggqqplot(germ.per$percent.germ)
+germ.per %>%
+  group_by(species) %>%
+  shapiro_test(percent.germ)
+# Bound between 0 - 1; Not normally distributed, skewed positive; will use beta regression
+
+# germination time
+ggdensity(germ.time$days.to.germ, fill = "lightgray")
+ggqqplot(germ.time$days.to.germ)
+germ.time %>%
+  group_by(species) %>%
+  mutate(days.to.germ=log10(days.to.germ)) %>% 
+  shapiro_test(days.to.germ)
+# Skewed strongly positive, will possibly use GLM (Inverse Gaussian with Log Link)
+
+# aboveground biomass
+ggdensity(bm.grow.psf$agb.rate, fill = "lightgray")
+ggqqplot(bm.grow.psf$agb.rate)
+bm.grow.psf %>%
+  mutate(agb.rate=sqrt(agb.rate)) %>% 
+  group_by(species) %>%
+  shapiro_test(agb.rate)
+
+# belowground biomass
+ggdensity(bm.grow.psf$bgb.rate, fill = "lightgray")
+ggqqplot(bm.grow.psf$bgb.rate)
+bm.grow.psf %>%
+  group_by(species) %>%
+  shapiro_test(bgb.rate)
+
+# root:shoot
+ggdensity(bm.grow.psf$rs.ratio, fill = "lightgray")
+ggqqplot(bm.grow.psf$rs.ratio)
+bm.grow.psf %>%
+  group_by(species) %>%
+  shapiro_test(rs.ratio)
+```
+
+### Test for differences in response variables between species * inoculum
+
+```{r}
+# growth rate
+growth.lm <- lm(bm.rate ~ species * inoculum, data=bm.grow.psf)
+Anova(growth.lm)
+summary(growth.lm)
+
+# germination rate
+germ.rate.br <- betareg(percent.germ ~ species * inoculum, data=germ.per)
+summary(germ.rate.br)
+Anova(germ.rate.br)
+
+# time to germination
+ttg.glm <- glm(days.to.germ ~ species * inoculum, family=inverse.gaussian(link="log"), data=germ.time)
+summary(ttg.glm)
+
+ttg.lm <- lm(days.to.germ ~ species * inoculum, data=germ.time)
+Anova(ttg.lm)
+summary(ttg.lm)
+qqnorm(residuals(ttg.glm, type="deviance"))
+
+# aboveground biomass
+# AIC of lm was lower that glm; glm generally not a good fit #
+agb.lm <- lm(agb.rate ~ species * inoculum, data=bm.grow.psf)
+summary(agb.lm)
+Anova(agb.lm)
+
+# belowground biomass
+bgb.lm <- lm(bgb.rate ~ species * inoculum, data=bm.grow.psf)
+summary(bgb.lm)
+Anova(bgb.lm)
+
+# root:shoot ratio
+rsr.lm <- lm(rs.ratio ~ species * inoculum, data=bm.grow.psf)
+summary(rsr.lm)
+Anova(rsr.lm)
+
+# mean and sd of root:shoot ratio
+bm.grow.psf %>% group_by(species, inoculum) %>% drop_na(rs.ratio) %>% summarise(mean=mean(rs.ratio))
+bm.grow.psf %>% group_by(species) %>% drop_na(rs.ratio) %>% summarise(sd=sd(rs.ratio))
+```
+### Analyze differences between treatment groups within species
+
+```{r}
+# relative performance
+
+# PITA
+pita.bm.lm <- lm(psf ~ inoculum, data=bm.grow.psf %>% filter(species=="PITA"))
+summary(pita.bm.lm)
+
+qqnorm(residuals(pita.bm.lm, type="deviance"))
+
+pita.bm.aov <- aov(pita.bm.lm)
+TukeyHSD(pita.bm.aov, conf.level=0.95)
+
+# MOCE
+moce.bm.lm <- lm(psf ~ inoculum, data=bm.grow.psf %>% filter(species=="MOCE"))
+summary(moce.bm.lm)
+
+qqnorm(residuals(moce.bm.lm, type="deviance")) # More normal
+
+moce.bm.aov <- aov(moce.bm.lm)
+TukeyHSD(moce.bm.aov, conf.level=0.95)
+
+# ILGL
+ilgl.bm.lm <- lm(psf ~ inoculum, data=bm.grow.psf %>% filter(species=="ILGL"))
+summary(ilgl.bm.lm)
+
+qqnorm(residuals(ilgl.bm.lm, type="deviance"))
+
+ilgl.bm.aov <- aov(ilgl.bm.lm)
+TukeyHSD(ilgl.bm.aov, conf.level=0.95)
+
+# aboveground biomass
+
+# MOCE
+# AIC of lm was lower that glm; glm generally not a good fit #
+agb.lm.moce <- lm(log10(agb.rate) ~ inoculum, data=bm.grow.psf %>% filter(species=="MOCE"))
+summary(agb.lm.moce)
+Anova(agb.lm.moce)
+
+# ILGL
+agb.lm.ilgl <- lm(agb.rate ~ inoculum, data=bm.grow.psf %>% filter(species=="ILGL"))
+summary(agb.lm.ilgl)
+Anova(agb.lm.ilgl)
+
+# PITA 
+agb.lm.pita <- lm(agb.rate ~ inoculum, data=bm.grow.psf %>% filter(species=="PITA"))
+summary(agb.lm.pita)
+Anova(agb.lm.pita)
+
+# belowground biomass
+
+# MOCE
+bgb.lm.moce <- lm(log10(bgb.rate) ~ inoculum, data=bm.grow.psf %>% filter(species=="MOCE"))
+summary(bgb.lm.moce)
+Anova(bgb.lm.moce)
+
+# ILGL
+bgb.lm.ilgl <- lm(bgb.rate ~ inoculum, data=bm.grow.psf %>% filter(species=="ILGL"))
+summary(bgb.lm.ilgl)
+Anova(bgb.lm.ilgl)
+
+# PITA
+bgb.lm.pita <- lm(bgb.rate ~ inoculum, data=bm.grow.psf %>% filter(species=="PITA"))
+summary(bgb.lm.pita)
+Anova(bgb.lm.pita)
+
+## nodule biomass rate (MOCE only)
+
+nod.lm <- lm(nod.rate ~ inoculum, data=bm.grow.psf %>% filter(species=="MOCE"))
+summary(nod.lm)
+Anova(nod.lm)
+```
+
+### Analyze differences between species in inoculum reponse
+
+```{r}
+# Inoculated versus Uninoculated 
+inoc.psf <- lm(psf~inoc.type, data=bm.grow.psf)
+Anova(inoc.psf)
+ggplot(bm.grow.psf) + geom_boxplot(aes(x=inoc.type, y=psf))
+
+# species differences in forest soil
+for.psf <- lm(psf~species, data=bm.grow.psf %>% filter(inoculum=="Forest"))
+summary(for.psf)
+ggplot(bm.grow.psf %>% filter(inoculum=="Forest")) + geom_boxplot(aes(x=species, y=psf))
+
+# species differences in shrub soil
+shr.psf <- lm(psf~species, data=bm.grow.psf %>% filter(inoculum=="Shrub"))
+summary(shr.psf)
+ggplot(bm.grow.psf %>% filter(inoculum=="Shrub")) + geom_boxplot(aes(x=species, y=psf))
+
+# species differences in sterile soil
+ste.psf <- lm(psf~species, data=bm.grow.psf %>% filter(inoculum=="Sterile"))
+summary(ste.psf)
+ggplot(bm.grow.psf %>% filter(inoculum=="Sterile")) + geom_boxplot(aes(x=species, y=psf))
+```
+
+# Relative performance across species and inocula (Figure 2)
+
+```{r}
+psf.bw <- c("Forest"="gray30", "Shrub"="gray", "Sterile"="gray95")
+
+psf.values <- ggplot(bm.grow.psf %>% 
+         mutate(species = replace(species, species=="ILGL", "Ilex glabra")) %>%  
+       mutate(species = replace(species, species=="MOCE", "Morella cerifera")) %>%  
+       mutate(species = replace(species, species=="PITA", "Pinus taeda"))) + 
+  geom_hline(yintercept=0, linetype="dotted") + 
+  geom_boxplot(aes(x=inoculum, y=psf, fill=inoculum)) + 
+  ylab("Relative Performance") + 
+  xlab("Inoculum") + 
+  scale_fill_manual(values = psf.bw) + 
+  theme(legend.position="NONE", 
+        strip.text = element_text(face = "italic"),
+        strip.background = element_rect(fill="transparent"),
+        panel.background = element_rect(fill = "transparent", color = NA),
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 1)) + 
+  facet_wrap(~ species)
+psf.values
+
+ggsave("Figures/Figure 2 BW.png", plot=psf.values, width = 5, height = 3.5, device='tiff', dpi=500, bg = "transparent")
+```
